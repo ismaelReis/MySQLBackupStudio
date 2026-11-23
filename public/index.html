@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MySQL Backup Studio</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230d1117'/%3E%3Cellipse cx='32' cy='20' rx='16' ry='7' fill='%23f29111'/%3E%3Cpath d='M16 20v24c0 3.9 7.2 7 16 7s16-3.1 16-7V20' fill='none' stroke='%23f29111' stroke-width='4'/%3E%3Cpath d='M16 32c0 3.9 7.2 7 16 7s16-3.1 16-7' fill='none' stroke='%23f29111' stroke-width='4'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <span class="brand-logo" id="brand-logo"></span>
+        <span class="brand-text">
+          <strong>MySQL Backup</strong>
+          <small>Studio</small>
+        </span>
+      </div>
+
+      <nav class="nav" id="nav">
+        <a href="#/overview" data-route="overview"><span data-icon="dashboard"></span><span class="nav-label">Visão geral</span></a>
+        <a href="#/connections" data-route="connections"><span data-icon="database"></span><span class="nav-label">Conexões</span></a>
+        <a href="#/jobs" data-route="jobs"><span data-icon="clock"></span><span class="nav-label">Agendamentos</span></a>
+        <a href="#/backups" data-route="backups"><span data-icon="folder"></span><span class="nav-label">Backups</span></a>
+        <a href="#/settings" data-route="settings"><span data-icon="settings"></span><span class="nav-label">Configurações</span></a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="status-line" id="server-status">
+          <span class="dot"></span><span>Conectando...</span>
+        </div>
+        <div class="version" id="version-label">v1.0.0</div>
+      </div>
+    </aside>
+
+    <main class="main" id="main">
+      <div class="loading">Carregando…</div>
+    </main>
+  </div>
+
+  <div id="modal-root"></div>
+  <div id="toast-root" class="toast-root"></div>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+node_modules/
+data/
+.openchamber/
+*.log
+.DS_Store
+/.vs
