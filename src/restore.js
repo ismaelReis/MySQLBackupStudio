@@ -1,13 +1,41 @@
 import fs from 'node:fs';
+import path from 'node:path';
+import { pipeline } from 'node:stream/promises';
 import zlib from 'node:zlib';
 import mysql from 'mysql2/promise';
 import { escapeId } from 'mysql2';
 import { buildConfig } from './mysql.js';
 import { splitStatements } from './split-sql.js';
+import { TMP_DIR } from './config.js';
+
+async function stageBackup(source, destination) {
+  const input = await fs.promises.open(source, 'r');
+  try {
+    const { size: sourceBytes } = await input.stat();
+    const header = Buffer.alloc(2);
+    await input.read(header, 0, header.length, 0);
+    const compressed = source.toLowerCase().endsWith('.gz') || (header[0] === 0x1f && header[1] === 0x8b);
+    const streams = [input.createReadStream({ start: 0 })];
+    if (compressed) streams.push(zlib.createGunzip());
+    streams.push(fs.createWriteStream(destination, { flags: 'wx', mode: 0o600 }));
+    // Só entrega o SQL depois de ler tudo e, para gzip, verificar o trailer.
+    await pipeline(...streams);
+    const { size } = await fs.promises.stat(destination);
+    let hasSql = false;
+    for await (const _ of splitStatements(fs.createReadStream(destination))) {
+      hasSql = true;
+      break;
+    }
+    if (!hasSql) throw new Error('O arquivo não contém comandos SQL.');
+    return { sourceBytes, size };
+  } finally {
+    await input.close();
+  }
+}
 
 /**
  * Restaura um arquivo .sql ou .sql.gz em um banco de destino.
- * Os comandos são executados um a um, com progresso baseado no arquivo comprimido.
+ * Valida uma cópia local do arquivo inteiro antes de tocar no banco de destino.
  */
 export async function restoreDump({
   connection: connRecord,
@@ -19,15 +47,23 @@ export async function restoreDump({
   if (!/^[A-Za-z0-9_$.-]+$/.test(targetDatabase)) {
     throw new Error('Nome de banco de destino inválido.');
   }
-  const stat = await fs.promises.stat(filePath);
   const startedAt = Date.now();
+  const tempDir = await fs.promises.mkdtemp(path.join(TMP_DIR, 'restore-'));
+  const stagedPath = path.join(tempDir, 'backup.sql');
 
-  const connection = await mysql.createConnection(
-    buildConfig(connRecord, { multipleStatements: false, dateStrings: true })
-  );
-
+  let connection;
   let statements = 0;
   try {
+    onProgress({ phase: 'validate', statements: 0, percent: 0 });
+    let staged;
+    try {
+      staged = await stageBackup(filePath, stagedPath);
+    } catch (err) {
+      throw new Error(`Não foi possível validar o arquivo de backup: ${err.message}. Nenhuma alteração foi feita no banco de destino.`);
+    }
+    connection = await mysql.createConnection(
+      buildConfig(connRecord, { multipleStatements: false, dateStrings: true })
+    );
     await connection.query("SET SESSION time_zone = '+00:00'");
     await connection.query('SET SESSION foreign_key_checks = 0');
     await connection.query('SET SESSION unique_checks = 0');
@@ -45,21 +81,18 @@ export async function restoreDump({
     }
     await connection.query(`USE ${escapeId(targetDatabase)}`);
 
-    const raw = fs.createReadStream(filePath);
+    const raw = fs.createReadStream(stagedPath);
     let consumed = 0;
     raw.on('data', (chunk) => {
       consumed += chunk.length;
       onProgress({
         phase: 'restore',
         statements,
-        percent: stat.size ? Math.min(99, Math.round((consumed / stat.size) * 100)) : 0,
+        percent: Math.min(99, Math.round((consumed / staged.size) * 100)),
       });
     });
 
-    const isGzip = filePath.toLowerCase().endsWith('.gz') || (await isGzipFile(filePath));
-    const textStream = isGzip ? raw.pipe(zlib.createGunzip()) : raw;
-
-    for await (const statement of splitStatements(textStream)) {
+    for await (const statement of splitStatements(raw)) {
       try {
         await connection.query(statement);
         statements += 1;
@@ -74,21 +107,18 @@ export async function restoreDump({
       database: targetDatabase,
       statements,
       durationMs: Date.now() - startedAt,
-      bytes: stat.size,
+      bytes: staged.sourceBytes,
     };
   } finally {
-    try { await connection.query('SET SESSION foreign_key_checks = 1'); } catch { /* ignore */ }
-    try { await connection.end(); } catch { /* ignore */ }
-  }
-}
-
-async function isGzipFile(filePath) {
-  const handle = await fs.promises.open(filePath, 'r');
-  try {
-    const buf = Buffer.alloc(2);
-    await handle.read(buf, 0, 2, 0);
-    return buf[0] === 0x1f && buf[1] === 0x8b;
-  } finally {
-    await handle.close();
+    if (connection) {
+      try { await connection.query('SET SESSION foreign_key_checks = 1'); } catch { /* ignore */ }
+      try { await connection.end(); } catch { /* ignore */ }
+    }
+    await fs.promises.unlink(stagedPath).catch((err) => {
+      if (err.code !== 'ENOENT') console.error('[restore] limpeza:', err.code || err.message);
+    });
+    await fs.promises.rmdir(tempDir).catch((err) => {
+      if (err.code !== 'ENOENT') console.error('[restore] limpeza:', err.code || err.message);
+    });
   }
 }

@@ -1,6 +1,6 @@
 import express from 'express';
 import path from 'node:path';
-import fs from 'node:fs';
+import fs from 'node:fs/promises';
 import { APP_VERSION, BACKUP_DIR, DATA_DIR, HOST, PORT, PUBLIC_DIR } from './config.js';
 import { encrypt } from './secrets.js';
 import { publicConnection, state, mutate, uid } from './store.js';
@@ -9,11 +9,15 @@ import {
   cancelRun,
   events,
   isJobBusy,
-  listBackupFiles,
   nextRunForJob,
   requestRun,
 } from './backup.js';
+import {
+  backupFileId, backupFolder, legacyBackupId, listBackupFiles, normalizeBackupBase,
+  resolveBackupFile, verifyBackupBase,
+} from './backup-files.js';
 import { restoreDump } from './restore.js';
+import { canPickBackupFolder, pickBackupFolder } from './folder-picker.js';
 import { describeSchedule, isValidCron, scheduleToCron } from './cron.js';
 import { startScheduler } from './scheduler.js';
 
@@ -51,12 +55,13 @@ function serializeJob(job) {
     scheduleText: describeSchedule(job.schedule),
     nextRunAt: next ? next.toISOString() : null,
     busy: isJobBusy(job.id),
+    backupFolder: backupFolder(job),
     connectionName:
       state.connections.find((c) => c.id === job.connectionId)?.name || '(conexão removida)',
   };
 }
 
-function stats(files = listBackupFiles()) {
+function stats(files) {
   let totalBytes = 0;
   let totalBackups = 0;
   let failedLast24h = 0;
@@ -87,21 +92,28 @@ function stats(files = listBackupFiles()) {
   };
 }
 
-app.get('/api/state', (req, res) => {
+app.get('/api/state', asyncRoute(async (req, res) => {
   const limit = Math.min(Number(req.query.runs) || 60, 400);
-  const files = listBackupFiles();
+  const { files, unavailable } = await listBackupFiles();
   res.json({
     version: APP_VERSION,
     serverTime: new Date().toISOString(),
     paths: { dataDir: DATA_DIR, backupDir: BACKUP_DIR },
+    canPickBackupFolder: canPickBackupFolder(req),
     settings: state.settings,
     connections: state.connections.map(publicConnection),
     jobs: state.jobs.map(serializeJob),
-    runs: state.runs.slice(0, limit),
+    runs: state.runs.slice(0, limit).map((run) => ({
+      ...run,
+      databases: (run.databases || []).map((db) => db.file && !db.fileId
+        ? { ...db, fileId: backupFileId('default', db.file) }
+        : db),
+    })),
     stats: stats(files),
     backups: files,
+    unavailableBackupFolders: unavailable,
   });
-});
+}));
 
 app.get('/api/health', (req, res) => res.json({ ok: true, version: APP_VERSION }));
 
@@ -263,12 +275,53 @@ function readJobPayload(body, existing = null) {
       cron: schedule.cron || '0 2 * * *',
     },
     retention,
+    backupBase: body.backupBase === undefined ? (existing?.backupBase || '') : normalizeBackupBase(body.backupBase),
     enabled: body.enabled === undefined ? true : Boolean(body.enabled),
     notes: String(body.notes || ''),
   };
 }
 
-app.post('/api/jobs', asyncRoute(async (req, res) => {
+// Configurar ou sondar um destino pode acessar um compartilhamento de rede.
+function checkDestinationRequest(req, res, next) {
+  const host = req.get('host');
+  const origin = req.get('origin');
+  const fetchSite = req.get('sec-fetch-site');
+  const loopback = ['127.0.0.1', 'localhost', '[::1]'];
+  const configured = HOST === '::1' ? '[::1]' : HOST.toLowerCase();
+  try {
+    const requestUrl = new URL(`${req.protocol}://${host}`);
+    const localBind = loopback.includes(configured);
+    const hostAllowed = !localBind || loopback.includes(requestUrl.hostname);
+    if (host && hostAllowed && (!origin || origin === requestUrl.origin) &&
+        (!fetchSite || fetchSite === 'same-origin' || fetchSite === 'none')) return next();
+  } catch { /* cabeçalho inválido */ }
+  res.status(403).json({ error: 'Origem não permitida para configurar a pasta de backup.' });
+}
+
+app.post('/api/jobs/check-backup-folder', checkDestinationRequest, asyncRoute(async (req, res) => {
+  const base = normalizeBackupBase(req.body?.backupBase);
+  const jobId = req.body?.jobId;
+  const job = jobId === undefined ? null : state.jobs.find((item) => item.id === jobId);
+  if (jobId !== undefined && !job) {
+    return res.status(404).json({ error: 'Agendamento não encontrado.' });
+  }
+  try {
+    res.json({ folder: await verifyBackupBase(base, job?.id) });
+  } catch (err) {
+    throw new Error(`Não foi possível gravar na pasta ${base || BACKUP_DIR}: ${err.code || err.message}`);
+  }
+}));
+
+app.post('/api/jobs/pick-backup-folder', checkDestinationRequest, asyncRoute(async (req, res) => {
+  if (!canPickBackupFolder(req)) {
+    return res.status(403).json({ error: 'A seleção de pasta só está disponível no Windows, abrindo o app neste computador.' });
+  }
+  const initial = normalizeBackupBase(req.body?.backupBase) || BACKUP_DIR;
+  const selected = await pickBackupFolder(initial);
+  res.json({ backupBase: selected === null ? null : normalizeBackupBase(selected) });
+}));
+
+app.post('/api/jobs', checkDestinationRequest, asyncRoute(async (req, res) => {
   const payload = readJobPayload(req.body);
   const job = {
     id: uid('job'),
@@ -283,7 +336,7 @@ app.post('/api/jobs', asyncRoute(async (req, res) => {
   res.status(201).json(serializeJob(job));
 }));
 
-app.put('/api/jobs/:id', asyncRoute(async (req, res) => {
+app.put('/api/jobs/:id', checkDestinationRequest, asyncRoute(async (req, res) => {
   const existing = state.jobs.find((j) => j.id === req.params.id);
   if (!existing) return res.status(404).json({ error: 'Agendamento não encontrado.' });
   const payload = readJobPayload(req.body, existing);
@@ -303,10 +356,6 @@ app.delete('/api/jobs/:id', asyncRoute(async (req, res) => {
   mutate((s) => {
     s.jobs = s.jobs.filter((j) => j.id !== req.params.id);
   });
-  if (req.query.deleteFiles === '1') {
-    const dir = path.join(BACKUP_DIR, existing.id);
-    if (dir.startsWith(BACKUP_DIR)) await fs.promises.rm(dir, { recursive: true, force: true });
-  }
   res.json({ ok: true });
 }));
 
@@ -331,33 +380,34 @@ app.post('/api/runs/:id/cancel', (req, res) => {
 
 // ---------------------------------------------------------------- arquivos
 
-function resolveBackupPath(relativePath) {
-  const abs = path.resolve(BACKUP_DIR, String(relativePath || ''));
-  const root = path.resolve(BACKUP_DIR) + path.sep;
-  if (!abs.startsWith(root)) throw new Error('Caminho de backup inválido.');
-  return abs;
+async function requireBackupFile(id) {
+  try {
+    return await resolveBackupFile(id);
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      throw Object.assign(new Error('Arquivo de backup não encontrado.'), { status: 404 });
+    }
+    throw err;
+  }
 }
 
-app.get('/api/backups', (req, res) => {
-  const files = listBackupFiles();
-  res.json({ files, totalBytes: files.reduce((a, b) => a + b.bytes, 0) });
-});
+app.get('/api/backups', asyncRoute(async (req, res) => {
+  const { files, unavailable } = await listBackupFiles();
+  res.json({ files, unavailable, totalBytes: files.reduce((a, b) => a + b.bytes, 0) });
+}));
 
-app.get('/api/backups/download', (req, res) => {
-  const abs = resolveBackupPath(req.query.path);
-  if (!fs.existsSync(abs)) return res.status(404).json({ error: 'Arquivo não encontrado.' });
+app.get('/api/backups/download', asyncRoute(async (req, res) => {
+  const abs = await requireBackupFile(req.query.id ?? legacyBackupId(req.query.path));
   res.download(abs, path.basename(abs));
-});
+}));
 
 app.delete('/api/backups', asyncRoute(async (req, res) => {
-  const relativePath = String(req.query.path || '');
-  if (!relativePath) return res.status(400).json({ error: 'Informe o arquivo.' });
-  const abs = resolveBackupPath(relativePath);
-  await fs.promises.rm(abs, { force: true });
+  const id = req.query.id ?? legacyBackupId(req.query.path);
+  await fs.unlink(await requireBackupFile(id));
   mutate((s) => {
     for (const run of s.runs) {
       for (const db of run.databases || []) {
-        if (db.file === relativePath) db.fileMissing = true;
+        if (db.file && (db.fileId || backupFileId('default', db.file)) === id) db.fileMissing = true;
       }
     }
   });
@@ -367,21 +417,21 @@ app.delete('/api/backups', asyncRoute(async (req, res) => {
 // ---------------------------------------------------------------- restauração
 
 app.post('/api/restore', asyncRoute(async (req, res) => {
-  const { connectionId, targetDatabase, filePath, recreate } = req.body || {};
+  const { connectionId, targetDatabase, fileId, filePath, recreate } = req.body || {};
   const connection = state.connections.find((c) => c.id === connectionId);
   if (!connection) return res.status(400).json({ error: 'Selecione uma conexão de destino.' });
-  if (!filePath) return res.status(400).json({ error: 'Selecione um arquivo de backup.' });
+  if (!fileId && !filePath) return res.status(400).json({ error: 'Selecione um arquivo de backup.' });
   if (!targetDatabase) return res.status(400).json({ error: 'Informe o banco de destino.' });
 
-  const abs = resolveBackupPath(filePath);
-  if (!fs.existsSync(abs)) return res.status(404).json({ error: 'Arquivo de backup não encontrado.' });
+  const id = fileId ?? legacyBackupId(filePath);
+  const abs = await requireBackupFile(id);
 
   const runId = uid('restore');
   events.emit('event', {
     type: 'restore-started',
     runId,
     targetDatabase,
-    file: filePath,
+    file: id,
     at: new Date().toISOString(),
   });
   try {

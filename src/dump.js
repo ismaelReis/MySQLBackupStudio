@@ -196,13 +196,15 @@ export async function dumpDatabase({
   };
 
   const connection = await mysql.createConnection(buildConfig(connRecord));
-  const writer = await createGzipWriter(filePath);
+  const partialPath = `${filePath}.part`;
+  let writer;
 
   const checkCancel = () => {
     if (isCancelled()) throw new Error('Backup cancelado pelo usuário.');
   };
 
   try {
+    writer = await createGzipWriter(partialPath);
     await connection.query("SET SESSION time_zone = '+00:00'");
     // Snapshot consistente para tabelas InnoDB durante toda a leitura.
     await connection.query('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
@@ -389,7 +391,9 @@ export async function dumpDatabase({
 
     const uncompressedBytes = await writer.end();
     try { await connection.query('COMMIT'); } catch { /* ignore */ }
-    const { size } = await fs.promises.stat(filePath);
+    const { size } = await fs.promises.stat(partialPath);
+    checkCancel();
+    await fs.promises.rename(partialPath, filePath);
     return {
       ...stats,
       filePath,
@@ -398,8 +402,10 @@ export async function dumpDatabase({
       durationMs: Date.now() - startedAt,
     };
   } catch (err) {
-    try { writer.abort(); } catch { /* ignore */ }
-    await fs.promises.rm(filePath, { force: true }).catch(() => {});
+    if (writer) {
+      await writer.abort();
+      await fs.promises.unlink(partialPath).catch(() => {});
+    }
     throw err;
   } finally {
     try { await connection.end(); } catch { /* ignore */ }

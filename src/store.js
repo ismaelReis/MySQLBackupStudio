@@ -10,6 +10,7 @@ const DEFAULTS = {
   connections: [],
   jobs: [],
   runs: [],
+  backupDestinations: [],
 };
 
 function readState() {
@@ -23,6 +24,7 @@ function readState() {
       connections: parsed.connections || [],
       jobs: parsed.jobs || [],
       runs: parsed.runs || [],
+      backupDestinations: Array.isArray(parsed.backupDestinations) ? parsed.backupDestinations : [],
     };
   } catch (err) {
     console.error('[store] Falha ao ler app.json, começando vazio:', err.message);
