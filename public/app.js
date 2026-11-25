@@ -431,6 +431,7 @@ function renderJobs() {
         <div class="meta-row">${icon('calendar')}<span>${esc(job.scheduleText)}</span></div>
         <div class="meta-row">${icon('timer')}<span>${job.enabled && job.nextRunAt ? `Próxima: ${esc(fmtDateShort(job.nextRunAt))} (${esc(fmtRelative(job.nextRunAt))})` : 'Sem próxima execução'}</span></div>
         <div class="meta-row">${icon('shield')}<span>Retenção: ${retention.length ? esc(retention.join(' · ')) : 'sem limite'}</span></div>
+        <div class="meta-row">${icon('folder')}<span class="truncate" title="${esc(job.backupFolder)}">${esc(job.backupFolder)}</span></div>
         <div class="meta-row">${icon('pulse')}<span>Última: ${job.lastRunAt ? `${esc(fmtRelative(job.lastRunAt))} · ${STATUS[job.lastStatus]?.label || job.lastStatus}` : 'nunca executado'}</span></div>
       </div>
       <div class="entity-actions">
@@ -451,43 +452,46 @@ function renderJobs() {
 /* ------------------------------------------------------------------ backups */
 
 function renderBackups() {
-  const runs = S.runs.filter((r) => r.databases && r.databases.length);
+  const runs = S.runs.filter((r) => r.databases?.length || r.error);
   const files = S.backups || [];
-  const fileSet = new Set(files.map((f) => f.path));
+  const fileMap = new Map(files.map((f) => [f.id, f]));
+  const unavailable = S.unavailableBackupFolders || [];
   return `
     ${pageHead('Backups', 'Histórico de execuções e arquivos disponíveis para download e restauração.',
       `<button class="btn" data-action="refresh">${icon('refresh')} Atualizar</button>
        <button class="btn primary" data-action="new-job">${icon('plus')} Novo agendamento</button>`)}
 
     <div class="stack">
-      ${runs.length ? runs.map((r) => renderRunCard(r, fileSet)).join('') : `<div class="card">${emptyState('folder', 'Nenhum backup ainda', 'Os arquivos gerados aparecerão aqui, com opções de download e restauração.', `<button class="btn primary" data-action="new-job">${icon('plus')} Criar agendamento</button>`)}</div>`}
+      ${runs.length ? runs.map((r) => renderRunCard(r, fileMap)).join('') : `<div class="card">${emptyState('folder', 'Nenhum backup ainda', 'Os arquivos gerados aparecerão aqui, com opções de download e restauração.', `<button class="btn primary" data-action="new-job">${icon('plus')} Criar agendamento</button>`)}</div>`}
     </div>
 
     <div class="card" style="margin-top:22px">
       <div class="card-head">
-        <h2>Arquivos na pasta de backups</h2>
+        <h2>Arquivos nas pastas de backup</h2>
         <span class="small muted">${fmtNumber(S.stats.diskFiles)} arquivo(s) · ${fmtBytes(S.stats.diskBytes)}</span>
       </div>
       <div class="card-body flush">
+        ${unavailable.length ? `<div class="warn-box">Pastas não acessíveis: ${unavailable.map((folder) => `<span class="mono">${esc(folder)}</span>`).join(' · ')}</div>` : ''}
         ${files.length ? `<div class="table-wrap"><table>
           <thead><tr><th>Arquivo</th><th class="right">Tamanho</th><th>Modificado</th><th class="right">Ações</th></tr></thead>
           <tbody>
             ${files.map((f) => `<tr>
-              <td class="mono truncate" title="${esc(f.path)}">${esc(f.path)}</td>
+              <td class="mono truncate" title="${esc(f.displayPath)}">${esc(f.displayPath)}</td>
               <td class="right small nowrap">${fmtBytes(f.bytes)}</td>
               <td class="small muted nowrap">${esc(fmtDateTime(f.modifiedAt))}</td>
               <td class="right nowrap">
-                <a class="btn small" href="/api/backups/download?path=${encodeURIComponent(f.path)}">${icon('download')} Baixar</a>
-                <button class="btn small danger" data-action="delete-file" data-path="${esc(f.path)}" aria-label="Excluir arquivo" title="Excluir arquivo">${icon('trash')}</button>
+                 <a class="btn small" href="/api/backups/download?id=${encodeURIComponent(f.id)}">${icon('download')} Baixar</a>
+                 <button class="btn small" data-action="restore" data-file-id="${esc(f.id)}" data-file="${esc(f.displayPath)}" data-database="${esc(f.database)}">${icon('restore')} Restaurar</button>
+                 <button class="btn small danger" data-action="delete-file" data-file-id="${esc(f.id)}" data-path="${esc(f.displayPath)}" aria-label="Excluir arquivo" title="Excluir arquivo">${icon('trash')}</button>
               </td>
             </tr>`).join('')}
           </tbody>
-        </table></div>` : `<div class="empty">${icon('folder')}<p>Nenhum arquivo encontrado em <code>data/backups</code>.</p></div>`}
+        </table></div>` : `<div class="empty">${icon('folder')}<p>Nenhum arquivo disponível nas pastas de backup.</p></div>`}
       </div>
     </div>`;
 }
 
-function renderRunCard(run, fileSet = null) {
+function renderRunCard(run, fileMap) {
   const t = runTotals(run);
   const live = liveProgress.get(run.id);
   const isActive = ['running', 'queued'].includes(run.status);
@@ -509,7 +513,8 @@ function renderRunCard(run, fileSet = null) {
     </div>
     <div class="run-dbs">
       ${(run.databases || []).map((db) => {
-        const existsOnDisk = db.file && !db.fileMissing && (!fileSet || fileSet.has(db.file));
+        const file = fileMap.get(db.fileId);
+        const existsOnDisk = Boolean(file);
         const canRestore = db.status === 'success' && existsOnDisk;
         const canDownload = existsOnDisk;
         return `<div class="db-row">
@@ -519,11 +524,11 @@ function renderRunCard(run, fileSet = null) {
             ${db.status === 'success'
               ? `<span>${fmtBytes(db.bytes)}</span><span>${plural(db.rows, 'linha', 'linhas')}</span><span>${plural(db.tables, 'tabela', 'tabelas')}</span><span>${esc(fmtDuration(db.durationMs))}</span>`
               : `<span class="truncate" title="${esc(db.error || '')}">${esc(db.error || 'Aguardando…')}</span>`}
-            ${db.file && !existsOnDisk ? '<span class="pill yellow">arquivo removido pela retenção</span>' : ''}
+            ${db.file && !existsOnDisk ? '<span class="pill yellow">arquivo indisponível</span>' : ''}
           </div>
           <div class="db-actions">
-            ${canDownload ? `<a class="btn small" href="/api/backups/download?path=${encodeURIComponent(db.file)}" title="Baixar .sql.gz">${icon('download')} Baixar</a>` : ''}
-            ${canRestore ? `<button class="btn small" data-action="restore" data-file="${esc(db.file)}" data-database="${esc(db.name)}" title="Restaurar em um banco">${icon('restore')} Restaurar</button>` : ''}
+            ${canDownload ? `<a class="btn small" href="/api/backups/download?id=${encodeURIComponent(file.id)}" title="Baixar .sql.gz">${icon('download')} Baixar</a>` : ''}
+            ${canRestore ? `<button class="btn small" data-action="restore" data-file-id="${esc(file.id)}" data-file="${esc(file.displayPath)}" data-database="${esc(db.name)}" title="Restaurar em um banco">${icon('restore')} Restaurar</button>` : ''}
           </div>
         </div>`;
       }).join('')}
@@ -567,7 +572,7 @@ function renderSettings() {
           <div class="section-label">Instalação</div>
           <div class="kv"><span class="k">Versão</span><span class="v">${esc(S.version)}</span></div>
           <div class="kv"><span class="k">Pasta de dados</span><span class="v mono small">${esc(S.paths?.dataDir || 'data')}</span></div>
-          <div class="kv"><span class="k">Pasta de backups</span><span class="v mono small">${esc(S.paths?.backupDir || 'data/backups')}</span></div>
+          <div class="kv"><span class="k">Pasta padrão de backups</span><span class="v mono small">${esc(S.paths?.backupDir || 'data/backups')}</span></div>
           <div class="kv"><span class="k">Arquivos</span><span class="v">${fmtNumber(S.stats.diskFiles)} · ${fmtBytes(S.stats.diskBytes)}</span></div>
           <div class="kv"><span class="k">Servidor</span><span class="v mono small">${esc(location.host)}</span></div>
         </div>
@@ -870,7 +875,21 @@ async function openJobModal(job = null) {
         <span class="help">0 = não apagar por idade.</span>
       </div>
     </div>
-    <div class="hint-box">A retenção é aplicada por banco, imediatamente após cada backup. Os arquivos antigos são apagados do disco.</div>
+    <div class="hint-box">A retenção é aplicada por banco na pasta usada pela execução, depois de gerar o backup com sucesso.</div>
+    <div class="divider"></div>
+    <div class="field">
+      <label for="job-backup-base">Pasta de backup (opcional)</label>
+      <input id="job-backup-base" class="input mono" readonly value="${esc(job?.backupBase || '')}" placeholder="${esc(S.paths.backupDir)}">
+      <span class="help">O app cria uma subpasta por agendamento e não move arquivos antigos.</span>
+      ${job ? `<span class="help">Destino salvo: <span class="mono">${esc(job.backupFolder)}</span></span>` : ''}
+      <div class="inline">
+        <button type="button" class="btn small" id="job-pick-folder"${S.canPickBackupFolder ? '' : ' disabled'}>${icon('folder')} Selecionar pasta…</button>
+        <button type="button" class="btn small" id="job-reset-folder"${job?.backupBase ? '' : ' disabled'}>Usar pasta padrão</button>
+        <button type="button" class="btn small" id="job-check-folder">Verificar pasta</button>
+        <span id="job-folder-status" class="help" role="status"></span>
+      </div>
+      ${S.canPickBackupFolder ? '' : '<span class="help">Para selecionar outra pasta, abra o app localmente em uma sessão do Windows.</span>'}
+    </div>
     <div class="divider"></div>
     <label class="check">
       <input type="checkbox" id="job-enabled" ${job ? (job.enabled ? 'checked' : '') : 'checked'}>
@@ -968,6 +987,54 @@ async function openJobModal(job = null) {
     }
   });
 
+  const folderInput = $('#job-backup-base', el);
+  const folderStatus = $('#job-folder-status', el);
+  const checkFolder = $('#job-check-folder', el);
+  const pickFolder = $('#job-pick-folder', el);
+  const resetFolder = $('#job-reset-folder', el);
+  const saveJob = $('#job-save', el);
+  pickFolder.addEventListener('click', async () => {
+    if (saveJob.disabled) return;
+    pickFolder.disabled = resetFolder.disabled = checkFolder.disabled = saveJob.disabled = true;
+    folderStatus.textContent = 'Selecione a pasta na janela do Windows…';
+    try {
+      const { backupBase } = await api('/api/jobs/pick-backup-folder', {
+        method: 'POST',
+        body: { backupBase: folderInput.value },
+      });
+      if (backupBase !== null) folderInput.value = backupBase;
+      folderStatus.textContent = '';
+    } catch (err) {
+      folderStatus.textContent = err.message;
+    } finally {
+      pickFolder.disabled = checkFolder.disabled = saveJob.disabled = false;
+      resetFolder.disabled = !folderInput.value;
+    }
+  });
+  resetFolder.addEventListener('click', () => {
+    folderInput.value = '';
+    folderStatus.textContent = '';
+    resetFolder.disabled = true;
+  });
+  checkFolder.addEventListener('click', async () => {
+    const backupBase = folderInput.value;
+    checkFolder.disabled = true;
+    pickFolder.disabled = true;
+    folderStatus.textContent = 'Verificando acesso…';
+    try {
+      const { folder } = await api('/api/jobs/check-backup-folder', {
+        method: 'POST',
+        body: { backupBase, jobId: job?.id },
+      });
+      if (folderInput.value === backupBase) folderStatus.textContent = `Gravação permitida em ${folder}.`;
+    } catch (err) {
+      if (folderInput.value === backupBase) folderStatus.textContent = err.message;
+    } finally {
+      checkFolder.disabled = false;
+      pickFolder.disabled = !S.canPickBackupFolder;
+    }
+  });
+
   connSelect.addEventListener('change', () => loadDbs(connSelect.value));
   await loadDbs(connSelect.value);
 
@@ -999,6 +1066,7 @@ async function openJobModal(job = null) {
         keepDays: Number($('#job-keep-days', el).value) || 0,
       },
       notes: $('#job-notes', el).value,
+      backupBase: folderInput.value,
     };
 
     const btn = $('#job-save', el);
@@ -1019,7 +1087,7 @@ async function openJobModal(job = null) {
 
 /* ------------------------------------------------------------------ restauração */
 
-function openRestoreModal(file, database) {
+function openRestoreModal(fileId, file, database) {
   const conns = S.connections;
   if (!conns.length) {
     toast('error', 'Nenhuma conexão cadastrada', 'Cadastre uma conexão para restaurar o backup.');
@@ -1028,7 +1096,7 @@ function openRestoreModal(file, database) {
   const body = `<form id="restore-form" class="form">
     <div class="hint-box">
       <strong>Arquivo:</strong> <span class="mono">${esc(file)}</span><br>
-      <strong>Banco de origem:</strong> <span class="mono">${esc(database)}</span>
+      <strong>Banco de origem:</strong> <span class="mono">${esc(database || 'Não identificado')}</span>
     </div>
     <div class="field">
       <label for="restore-conn">Conexão de destino</label>
@@ -1094,7 +1162,7 @@ function openRestoreModal(file, database) {
     try {
       const result = await api('/api/restore', {
         method: 'POST',
-        body: { connectionId, targetDatabase, filePath: file, recreate },
+        body: { connectionId, targetDatabase, fileId, recreate },
       });
       statusEl.innerHTML = `<span style="color:var(--green)">${esc(fmtNumber(result.statements))} comandos restaurados em ${esc(fmtDuration(result.durationMs))}.</span>`;
       toast('success', 'Backup restaurado', `Banco "${targetDatabase}" restaurado com sucesso.`);
@@ -1244,7 +1312,7 @@ async function handleAction(action, el) {
       break;
     }
     case 'restore':
-      openRestoreModal(el.dataset.file, el.dataset.database);
+      openRestoreModal(el.dataset.fileId, el.dataset.file, el.dataset.database);
       break;
     case 'delete-file': {
       const rel = el.dataset.path;
@@ -1256,7 +1324,7 @@ async function handleAction(action, el) {
       });
       if (!ok) return;
       try {
-        await api(`/api/backups?path=${encodeURIComponent(rel)}`, { method: 'DELETE' });
+        await api(`/api/backups?id=${encodeURIComponent(el.dataset.fileId)}`, { method: 'DELETE' });
         toast('success', 'Arquivo excluído');
         await loadState();
       } catch (err) {
@@ -1304,13 +1372,17 @@ function onServerEvent(ev) {
       if (ev.type === 'run-finished') {
         liveProgress.delete(ev.runId);
         const msg = ev.status === 'success' ? 'Backup concluído com sucesso' : ev.status === 'partial' ? 'Backup concluído com falhas parciais' : ev.status === 'cancelled' ? 'Backup cancelado' : 'Backup falhou';
-        toast(ev.status === 'success' ? 'success' : ev.status === 'failed' ? 'error' : 'info', msg, ev.totals ? `${ev.totals.ok}/${ev.totals.databases} banco(s) · ${fmtBytes(ev.totals.bytes)}` : '');
+        toast(ev.status === 'success' ? 'success' : ev.status === 'failed' ? 'error' : 'info', msg, ev.error || (ev.totals ? `${ev.totals.ok}/${ev.totals.databases} banco(s) · ${fmtBytes(ev.totals.bytes)}` : ''));
       }
       scheduleRefresh(250);
       break;
     case 'restore-progress': {
       const status = $('[data-restore-status]');
-      if (status) status.textContent = `${fmtNumber(ev.statements)} comando(s) executado(s) · ${ev.percent || 0}%`;
+      if (status) {
+        status.textContent = ev.phase === 'validate'
+          ? 'Validando o arquivo de backup…'
+          : `${fmtNumber(ev.statements)} comando(s) executado(s) · ${ev.percent || 0}%`;
+      }
       break;
     }
     case 'restore-finished':

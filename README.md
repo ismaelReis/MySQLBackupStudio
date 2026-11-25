@@ -9,6 +9,7 @@ Alternativa local ao SQLBackupAndFTP para **backup agendado de bancos MySQL e Ma
 - **Conexões MySQL/MariaDB** salvas com senha criptografada (AES-256-GCM).
 - **Seleção de bancos**: escolha bancos específicos ou "Todos os bancos" (inclui bancos criados no futuro).
 - **Backup agendado**: manual, diário, semanal ou expressão cron (ex.: `0 */6 * * *`).
+- **Pasta por agendamento**: salve os arquivos no destino padrão, em outro disco ou em um compartilhamento de rede.
 - **Backup nativo**: gera `.sql.gz` pelo próprio app, sem precisar instalar `mysqldump`. Inclui estrutura, dados, views, procedures, functions, triggers e events.
 - **Snapshot consistente** de tabelas InnoDB (`START TRANSACTION WITH CONSISTENT SNAPSHOT`).
 - **Retenção automática**: mantenha os últimos N backups por banco e/ou apague arquivos com mais de X dias.
@@ -69,6 +70,7 @@ GRANT SELECT, SHOW VIEW, TRIGGER, EVENT ON *.* TO 'backup'@'%';
    - escolha a conexão;
    - marque um ou mais bancos (ou **Todos os bancos**);
    - escolha a frequência e o horário;
+   - opcionalmente, clique em **Selecionar pasta…** e escolha o destino na janela do Windows. Use **Verificar pasta** para conferir o acesso;
    - defina a retenção (ex.: manter 7 backups, ou apagar após 30 dias);
    - salve.
 3. Clique em **Executar** para gerar o primeiro backup imediatamente.
@@ -89,7 +91,11 @@ data/
         └── outra__20261109-173027350.sql.gz
 ```
 
-O nome do arquivo segue `<banco>__AAAAMMDD-HHMMSSmmm.sql.gz` no horário local.
+Novos arquivos seguem `<banco>__AAAAMMDD-HHMMSSmmm-<sufixo>.sql.gz` no horário local. Durante a gravação, o arquivo tem a extensão `.part` e não aparece na lista de backups.
+
+Em cada agendamento, **Selecionar pasta…** abre o seletor de pastas do Windows. Você pode escolher uma pasta em outro disco ou em um compartilhamento de rede. **Usar pasta padrão** volta para `data/backups`. O seletor exige que o app esteja rodando na sua sessão do Windows e seja aberto localmente no navegador. O app cria uma subpasta exclusiva para o agendamento. Use apenas pastas e compartilhamentos confiáveis, graváveis pela conta que roda o app. `app.json` e a chave de criptografia não mudam de lugar.
+
+Trocar o destino não move arquivos anteriores: eles continuam na tela **Backups** enquanto a pasta estiver acessível. A retenção age apenas no destino atual, após um backup bem-sucedido. Se o destino não estiver disponível, a execução falha sem gravar em outra pasta. Excluir um agendamento não apaga seus arquivos.
 
 ## Restauração
 
@@ -100,6 +106,8 @@ Em **Backups**, clique em **Restaurar** no banco desejado:
 - opcionalmente marque **Apagar e recriar o banco de destino**.
 
 O backup executa `DROP TABLE` das tabelas presentes no arquivo antes de recriá-las. Tabelas do destino que não existem no backup permanecem, a menos que "apagar e recriar" seja marcado.
+
+Antes de tocar no banco de destino, o app lê todo o arquivo e valida a descompactação dos backups gzip. A restauração precisa de espaço em `data/tmp` para o SQL descompactado. A validação do arquivo não torna a restauração transacional: um erro durante a execução do SQL ainda pode deixar alterações parciais.
 
 Também é possível restaurar pela linha de comando:
 
@@ -140,11 +148,14 @@ Alternativa: crie um atalho para `start.cmd` na pasta `shell:startup` (`Win+R` �
 | POST | `/api/connections/test` | Testar conexão |
 | GET | `/api/connections/:id/databases` | Listar bancos |
 | POST/PUT/DELETE | `/api/jobs[/:id]` | Gerenciar agendamentos |
+| POST | `/api/jobs/pick-backup-folder` | Abrir o seletor de pastas na sessão local do Windows |
+| POST | `/api/jobs/check-backup-folder` | Verificar a pasta (`backupBase` e, ao editar, `jobId`) |
 | POST | `/api/jobs/:id/run` | Executar agora |
 | POST | `/api/runs/:id/cancel` | Cancelar execução |
-| GET | `/api/backups/download?path=` | Baixar `.sql.gz` |
-| DELETE | `/api/backups?path=` | Excluir arquivo |
-| POST | `/api/restore` | Restaurar backup |
+| GET | `/api/backups` | Listar arquivos e destinos indisponíveis |
+| GET | `/api/backups/download?id=` | Baixar um arquivo pelo identificador |
+| DELETE | `/api/backups?id=` | Excluir um arquivo pelo identificador |
+| POST | `/api/restore` | Restaurar backup pelo `fileId` |
 | GET | `/api/events` | Progresso em tempo real (SSE) |
 
 ## Desenvolvimento
@@ -159,6 +170,7 @@ Estrutura:
 src/
 ├── server.js      # rotas HTTP e SSE
 ├── backup.js      # orquestração, fila e retenção
+├── backup-files.js # destinos por agendamento e acesso aos arquivos
 ├── dump.js        # geração do dump nativo
 ├── restore.js     # restauração
 ├── split-sql.js   # parser de comandos SQL (respeita strings, comentários e DELIMITER)
